@@ -1,0 +1,12 @@
+{
+  "name": "aranet4-reader",
+  "version": "1.0.0",
+  "description": "Node.js application to read temperature data from Aranet4 sensor via Bluetooth",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@abandonware/noble": "^1.9.2-15"
+  }
+} 
