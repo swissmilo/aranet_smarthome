@@ -1,5 +1,14 @@
 const noble = require('@abandonware/noble');
 const readline = require('readline');
+const axios = require('axios');
+require('dotenv').config();
+
+// Configuration from environment variables
+const CONFIG = {
+    API_ENDPOINT: process.env.API_ENDPOINT,
+    API_KEY: process.env.API_KEY,
+    DEVICE_ID: process.env.DEVICE_ID
+};
 
 let aranet4Device = null;
 
@@ -19,14 +28,44 @@ function getPIN() {
 }
 
 function parseCurrentReadings(data) {
-    const tempC = data.readInt16LE(2) / 20;
     return {
         co2: data.readUInt16LE(0),
-        temperatureC: tempC,
-        temperatureF: (tempC * 9/5) + 32,
+        temperature: data.readInt16LE(2) / 20,  // only in Celsius now
         humidity: data.readUInt8(6),
-        pressure: data.readUInt16LE(4) / 10
+        pressure: data.readUInt16LE(4) / 10,
+        timestamp: new Date().toISOString()  // add timestamp at reading time
     };
+}
+
+// Function to post data to server
+async function postToServer(readings) {
+    try {
+        const payload = {
+            deviceId: CONFIG.DEVICE_ID,
+            readings: {
+                co2: readings.co2,
+                temperature: readings.temperature,
+                humidity: readings.humidity,
+                pressure: readings.pressure,
+                timestamp: readings.timestamp
+            }
+        };
+
+        const response = await axios.post(CONFIG.API_ENDPOINT, payload, {
+            headers: {
+                'Content-Type': 'application/json',
+                'X-API-Key': CONFIG.API_KEY
+            }
+        });
+
+        if (response.status === 200) {
+            console.log('Successfully posted to server');
+        } else {
+            console.error('Server responded with status:', response.status);
+        }
+    } catch (error) {
+        console.error('Error posting to server:', error.message);
+    }
 }
 
 async function connectAndRead(peripheral) {
@@ -75,12 +114,15 @@ async function connectAndRead(peripheral) {
                 });
                 
                 const readings = parseCurrentReadings(data);
-                const timestamp = new Date().toLocaleTimeString();
-                console.log(`\n[${timestamp}] Readings:`);
+                const localTime = new Date(readings.timestamp).toLocaleTimeString();
+                console.log(`\n[${localTime}] Readings:`);
                 console.log(`CO2: ${readings.co2} ppm`);
-                console.log(`Temperature: ${readings.temperatureC.toFixed(1)}°C / ${readings.temperatureF.toFixed(1)}°F`);
+                console.log(`Temperature: ${readings.temperature.toFixed(1)}°C`);
                 console.log(`Humidity: ${readings.humidity}%`);
                 console.log(`Pressure: ${readings.pressure.toFixed(1)} hPa`);
+
+                // Post to server
+                await postToServer(readings);
             } catch (error) {
                 console.error('Error reading values:', error);
             }
