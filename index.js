@@ -43,13 +43,30 @@ function getPIN() {
 }
 
 function parseCurrentReadings(data) {
-    return {
-        co2: data.readUInt16LE(0),
-        temperature: data.readInt16LE(2) / 20,  // only in Celsius now
-        humidity: data.readUInt8(6),
-        pressure: data.readUInt16LE(4) / 10,
-        timestamp: new Date().toISOString()  // add timestamp at reading time
-    };
+    // Check if we have a valid buffer with enough bytes
+    if (!Buffer.isBuffer(data)) {
+        throw new Error('Invalid data: not a buffer');
+    }
+    
+    // We expect at least 7 bytes for all our readings
+    // (2 bytes CO2, 2 bytes temp, 2 bytes pressure, 1 byte humidity)
+    if (data.length < 7) {
+        throw new Error(`Invalid data length: got ${data.length} bytes, expected at least 7 bytes`);
+    }
+
+    try {
+        return {
+            co2: data.readUInt16LE(0),
+            temperature: data.readInt16LE(2) / 20,
+            humidity: data.readUInt8(6),
+            pressure: data.readUInt16LE(4) / 10,
+            timestamp: new Date().toISOString()
+        };
+    } catch (error) {
+        console.error('Raw buffer data:', data);
+        console.error('Buffer length:', data.length);
+        throw new Error(`Failed to parse sensor data: ${error.message}`);
+    }
 }
 
 // Function to post data to server
@@ -118,89 +135,44 @@ async function connectAndRead(peripheral) {
             throw new Error('Current readings characteristic not found');
         }
 
-        let pollInterval;
-        let isRunning = true;
-
-        // Function to read and display current values
-        async function readAndDisplayValues() {
-            if (!isRunning) return false;
-            
-            try {
-                const data = await new Promise((resolve, reject) => {
-                    currentReadingsChar.read((error, data) => {
-                        if (error) reject(error);
-                        else resolve(data);
-                    });
-                });
-                
-                const readings = parseCurrentReadings(data);
-                const localTime = new Date(readings.timestamp).toLocaleTimeString();
-                console.log(`\n[${localTime}] Readings:`);
-                console.log(`CO2: ${readings.co2} ppm`);
-                console.log(`Temperature: ${readings.temperature.toFixed(1)}°C`);
-                console.log(`Humidity: ${readings.humidity}%`);
-                console.log(`Pressure: ${readings.pressure.toFixed(1)} hPa`);
-
-                // Post to server
-                await postToServer(readings);
-                return true;
-            } catch (error) {
-                if (isRunning) {
-                    console.error('Error reading values:', error);
-                }
-                return false;
-            }
-        }
-
-        // Get initial reading
-        if (!await readAndDisplayValues()) {
-            throw new Error('Failed to get initial reading');
-        }
-        
-        console.log('\nPolling in intervals (Press Ctrl+C to exit)...');
-        
-        let consecutiveFailures = 0;
-        const MAX_FAILURES = 3;
-
-        return new Promise((resolve, reject) => {
-            // Set up polling interval (10 minutes = 600000 ms)
-            pollInterval = setInterval(async () => {
-                if (!isRunning) return;
-                
-                const success = await readAndDisplayValues();
-                if (!success) {
-                    consecutiveFailures++;
-                    console.log(`Failed reading attempt ${consecutiveFailures}/${MAX_FAILURES}`);
-                    if (consecutiveFailures >= MAX_FAILURES) {
-                        console.log('Too many consecutive failures, initiating reconnection...');
-                        isRunning = false;
-                        clearInterval(pollInterval);
-                        reject(new Error('Connection lost - needs reconnect'));
-                    }
+        // Single read operation
+        const data = await new Promise((resolve, reject) => {
+            currentReadingsChar.read((error, data) => {
+                if (error) reject(error);
+                else if (!data || data.length === 0) {
+                    reject(new Error('Received empty data from sensor'));
                 } else {
-                    consecutiveFailures = 0;
+                    resolve(data);
                 }
-            }, 600000);
-
-            // Handle disconnection
-            peripheral.once('disconnect', () => {
-                console.log('Device disconnected, initiating reconnection...');
-                isRunning = false;
-                clearInterval(pollInterval);
-                reject(new Error('Device disconnected - needs reconnect'));
-            });
-
-            // Handle cleanup
-            process.once('SIGINT', () => {
-                console.log('Received SIGINT, cleaning up...');
-                isRunning = false;
-                clearInterval(pollInterval);
-                resolve('shutdown');  // Indicate normal shutdown
             });
         });
         
+        const readings = parseCurrentReadings(data);
+        const localTime = new Date(readings.timestamp).toLocaleTimeString();
+        console.log(`\n[${localTime}] Readings:`);
+        console.log(`CO2: ${readings.co2} ppm`);
+        console.log(`Temperature: ${readings.temperature.toFixed(1)}°C`);
+        console.log(`Humidity: ${readings.humidity}%`);
+        console.log(`Pressure: ${readings.pressure.toFixed(1)} hPa`);
+
+        // Post to server
+        await postToServer(readings);
+        
+        // Clean disconnect
+        await peripheral.disconnectAsync();
+        console.log('Successfully disconnected from device');
+        
+        return 'success';
     } catch (error) {
         console.error('Error in connectAndRead:', error);
+        try {
+            if (peripheral.state === 'connected') {
+                await peripheral.disconnectAsync();
+                console.log('Cleaned up connection after error');
+            }
+        } catch (disconnectError) {
+            console.error('Error during disconnect:', disconnectError);
+        }
         throw error;
     }
 }
@@ -275,59 +247,43 @@ async function startScanning() {
 
 // Main application flow
 async function main() {
-    while (true) {  // Run indefinitely
+    const POLLING_INTERVAL = 1800000; // 30 minutes
+    
+    while (true) {
         try {
             console.log('Starting device discovery...');
             const peripheral = await startScanning();
             const result = await connectAndRead(peripheral);
             
-            // If we got here through a normal shutdown (Ctrl+C), exit the loop
-            if (result === 'shutdown') {
-                console.log('Normal shutdown requested');
-                break;
+            if (result === 'success') {
+                console.log(`\nWaiting ${POLLING_INTERVAL/60000} minutes until next reading...`);
+                await new Promise(resolve => setTimeout(resolve, POLLING_INTERVAL));
+            } else {
+                // If not successful, wait a shorter time before retry
+                console.log('Waiting 30 seconds before retry...');
+                await new Promise(resolve => setTimeout(resolve, 30000));
             }
         } catch (error) {
             console.error('Connection error:', error.message);
-            
-            // Wait before retrying
-            const RETRY_DELAY = 5000; // 5 seconds
-            console.log(`Retrying in ${RETRY_DELAY/1000} seconds...`);
-            await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
-            
-            // Clean up the existing connection if needed
-            if (aranet4Device && aranet4Device.state === 'connected') {
-                try {
-                    await aranet4Device.disconnectAsync();
-                } catch (disconnectError) {
-                    console.error('Error disconnecting:', disconnectError);
-                }
-            }
-            
-            // Continue the loop to retry
-            continue;
+            console.log('Waiting 30 seconds before retry...');
+            await new Promise(resolve => setTimeout(resolve, 30000));
         }
     }
-
-    // Final cleanup
-    await cleanup();
 }
 
 // Handle cleanup on exit
 async function cleanup() {
     console.log('\nCleaning up...');
-    if (aranet4Device) {
+    if (aranet4Device && aranet4Device.state === 'connected') {
         try {
             await noble.stopScanningAsync();
-            if (aranet4Device.state === 'connected') {
-                await aranet4Device.disconnectAsync();
-            }
+            await aranet4Device.disconnectAsync();
         } catch (error) {
             console.error('Error during disconnect:', error);
         }
     }
     rl.close();
-    // Force exit after 1 second if graceful shutdown fails
-    setTimeout(() => process.exit(0), 1000);
+    process.exit(0);
 }
 
 // Handle different exit scenarios
