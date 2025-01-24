@@ -3,6 +3,21 @@ const readline = require('readline');
 const axios = require('axios');
 require('dotenv').config();
 
+// Check if we're running on Linux (Raspberry Pi)
+if (process.platform === 'linux') {
+    // noble needs special permissions on Linux
+    console.log('Running on Linux, checking Bluetooth permissions...');
+    try {
+        const { execSync } = require('child_process');
+        // Check if we have the necessary permissions
+        execSync('hciconfig hci0 up');
+    } catch (error) {
+        console.error('Error accessing Bluetooth device. Make sure you have the right permissions:');
+        console.error('Try running: sudo setcap cap_net_raw+eip $(eval readlink -f `which node`)');
+        process.exit(1);
+    }
+}
+
 // Configuration from environment variables
 const CONFIG = {
     API_ENDPOINT: process.env.API_ENDPOINT,
@@ -123,24 +138,56 @@ async function connectAndRead(peripheral) {
 
                 // Post to server
                 await postToServer(readings);
+                return true; // Indicate successful reading
             } catch (error) {
                 console.error('Error reading values:', error);
+                return false; // Indicate failed reading
             }
         }
 
         // Get initial reading
-        await readAndDisplayValues();
+        if (!await readAndDisplayValues()) {
+            throw new Error('Failed to get initial reading');
+        }
         
-        console.log('\nPolling every 10 minutes (Press Ctrl+C to exit)...');
+        console.log('\nPolling in intervals (Press Ctrl+C to exit)...');
         
-        // Set up polling interval (10 minutes = 600000 ms)
-        const pollInterval = setInterval(readAndDisplayValues, 600000);
+        let consecutiveFailures = 0;
+        const MAX_FAILURES = 3;
+
+        // Set up polling interval (1 minute = 60000 ms)
+        const pollInterval = setInterval(async () => {
+            const success = await readAndDisplayValues();
+            if (!success) {
+                consecutiveFailures++;
+                console.log(`Failed reading attempt ${consecutiveFailures}/${MAX_FAILURES}`);
+                if (consecutiveFailures >= MAX_FAILURES) {
+                    console.log('Too many consecutive failures, reconnecting...');
+                    clearInterval(pollInterval);
+                    throw new Error('Connection lost');
+                }
+            } else {
+                consecutiveFailures = 0; // Reset counter on successful reading
+            }
+        }, 600000);
         
+        // Set up disconnect handler
+        peripheral.once('disconnect', () => {
+            console.log('Device disconnected');
+            clearInterval(pollInterval);
+            throw new Error('Device disconnected');
+        });
+
         // Keep the connection alive and handle cleanup
-        await new Promise((resolve) => {
+        return new Promise((resolve, reject) => {
             process.once('SIGINT', () => {
                 clearInterval(pollInterval);
                 resolve();
+            });
+            
+            peripheral.once('disconnect', () => {
+                clearInterval(pollInterval);
+                reject(new Error('Device disconnected'));
             });
         });
         
@@ -150,42 +197,100 @@ async function connectAndRead(peripheral) {
     }
 }
 
-// Main function to handle device discovery and reading
 async function startScanning() {
-    // Handle security/pairing requests
-    noble.on('security', async (peripheral, type) => {
-        console.log(`Security request type: ${type}`);
-        if (type === 'legacy') {
-            const pin = await getPIN();
-            peripheral.sendPairingResponse(pin);
+    return new Promise((resolve, reject) => {
+        let isConnected = false;
+
+        // Handle security/pairing requests
+        noble.on('security', async (peripheral, type) => {
+            console.log(`Security request type: ${type}`);
+            if (type === 'legacy') {
+                const pin = await getPIN();
+                peripheral.sendPairingResponse(pin);
+            }
+        });
+
+        const handleStateChange = async (state) => {
+            console.log('Bluetooth adapter state:', state);
+            if (state === 'poweredOn' && !isConnected) {
+                console.log('Scanning for BLE devices...');
+                try {
+                    await noble.startScanningAsync([], false);
+                } catch (error) {
+                    console.error('Error starting scan:', error);
+                    // On Raspberry Pi, we might need to reset the Bluetooth adapter
+                    if (process.platform === 'linux') {
+                        console.log('Attempting to reset Bluetooth adapter...');
+                        try {
+                            const { execSync } = require('child_process');
+                            execSync('sudo hciconfig hci0 reset');
+                            // Wait a bit for the adapter to reset
+                            await new Promise(resolve => setTimeout(resolve, 2000));
+                            await noble.startScanningAsync([], false);
+                        } catch (resetError) {
+                            console.error('Error resetting Bluetooth adapter:', resetError);
+                        }
+                    }
+                }
+            }
+        };
+
+        const handleDiscover = async (peripheral) => {
+            const name = peripheral.advertisement.localName;
+            
+            if (name?.includes('Aranet4') && !isConnected) {
+                console.log('Found Aranet4 device! Details:');
+                console.log('Name:', name);
+                
+                aranet4Device = peripheral;
+                isConnected = true;
+                
+                // Remove event listeners
+                noble.removeListener('stateChange', handleStateChange);
+                noble.removeListener('discover', handleDiscover);
+                
+                await noble.stopScanningAsync();
+                resolve(peripheral);
+            }
+        };
+
+        // Set up event handlers
+        noble.on('stateChange', handleStateChange);
+        noble.on('discover', handleDiscover);
+
+        // Initial state check
+        if (noble.state === 'poweredOn') {
+            handleStateChange('poweredOn');
         }
     });
+}
 
-    noble.on('stateChange', async (state) => {
-        if (state === 'poweredOn') {
-            console.log('Scanning for BLE devices...');
-            await noble.startScanningAsync([], false);
-        }
-    });
+// Main application flow
+async function main() {
+    let retryCount = 0;
+    const MAX_RETRIES = 5;
+    const RETRY_DELAY = 5000; // 5 seconds
 
-    noble.on('discover', async (peripheral) => {
-        const name = peripheral.advertisement.localName;
-        
-        if (name?.includes('Aranet4')) {
-            console.log('Found Aranet4 device! Details:');
-            console.log('Name:', name);
+    while (retryCount < MAX_RETRIES) {
+        try {
+            const peripheral = await startScanning();
+            await connectAndRead(peripheral);
+            break; // Exit loop if successful
+        } catch (error) {
+            console.error(`Attempt ${retryCount + 1}/${MAX_RETRIES} failed:`, error.message);
+            retryCount++;
             
-            aranet4Device = peripheral;
-            await noble.stopScanningAsync();
-            
-            try {
-                await connectAndRead(peripheral);
-            } catch (error) {
-                console.error('Error during device operation:', error);
-                await cleanup();
+            if (retryCount < MAX_RETRIES) {
+                console.log(`Retrying in ${RETRY_DELAY/1000} seconds...`);
+                await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
             }
         }
-    });
+    }
+
+    if (retryCount >= MAX_RETRIES) {
+        console.error('Max retries reached, exiting...');
+        await cleanup();
+    }
 }
 
 // Handle cleanup on exit
@@ -214,7 +319,7 @@ process.on('exit', () => {
 });
 
 // Start the application
-startScanning().catch(error => {
+main().catch(error => {
     console.error('Error in main application:', error);
     cleanup();
 }); 
