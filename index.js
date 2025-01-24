@@ -118,8 +118,13 @@ async function connectAndRead(peripheral) {
             throw new Error('Current readings characteristic not found');
         }
 
+        let pollInterval;
+        let isRunning = true;
+
         // Function to read and display current values
         async function readAndDisplayValues() {
+            if (!isRunning) return false;
+            
             try {
                 const data = await new Promise((resolve, reject) => {
                     currentReadingsChar.read((error, data) => {
@@ -138,10 +143,12 @@ async function connectAndRead(peripheral) {
 
                 // Post to server
                 await postToServer(readings);
-                return true; // Indicate successful reading
+                return true;
             } catch (error) {
-                console.error('Error reading values:', error);
-                return false; // Indicate failed reading
+                if (isRunning) {
+                    console.error('Error reading values:', error);
+                }
+                return false;
             }
         }
 
@@ -155,39 +162,40 @@ async function connectAndRead(peripheral) {
         let consecutiveFailures = 0;
         const MAX_FAILURES = 3;
 
-        // Set up polling interval (1 minute = 60000 ms)
-        const pollInterval = setInterval(async () => {
-            const success = await readAndDisplayValues();
-            if (!success) {
-                consecutiveFailures++;
-                console.log(`Failed reading attempt ${consecutiveFailures}/${MAX_FAILURES}`);
-                if (consecutiveFailures >= MAX_FAILURES) {
-                    console.log('Too many consecutive failures, reconnecting...');
-                    clearInterval(pollInterval);
-                    throw new Error('Connection lost');
-                }
-            } else {
-                consecutiveFailures = 0; // Reset counter on successful reading
-            }
-        }, 600000);
-        
-        // Set up disconnect handler
-        peripheral.once('disconnect', () => {
-            console.log('Device disconnected');
-            clearInterval(pollInterval);
-            throw new Error('Device disconnected');
-        });
-
-        // Keep the connection alive and handle cleanup
         return new Promise((resolve, reject) => {
-            process.once('SIGINT', () => {
-                clearInterval(pollInterval);
-                resolve();
-            });
-            
+            // Set up polling interval (10 minutes = 600000 ms)
+            pollInterval = setInterval(async () => {
+                if (!isRunning) return;
+                
+                const success = await readAndDisplayValues();
+                if (!success) {
+                    consecutiveFailures++;
+                    console.log(`Failed reading attempt ${consecutiveFailures}/${MAX_FAILURES}`);
+                    if (consecutiveFailures >= MAX_FAILURES) {
+                        console.log('Too many consecutive failures, initiating reconnection...');
+                        isRunning = false;
+                        clearInterval(pollInterval);
+                        reject(new Error('Connection lost - needs reconnect'));
+                    }
+                } else {
+                    consecutiveFailures = 0;
+                }
+            }, 600000);
+
+            // Handle disconnection
             peripheral.once('disconnect', () => {
+                console.log('Device disconnected, initiating reconnection...');
+                isRunning = false;
                 clearInterval(pollInterval);
-                reject(new Error('Device disconnected'));
+                reject(new Error('Device disconnected - needs reconnect'));
+            });
+
+            // Handle cleanup
+            process.once('SIGINT', () => {
+                console.log('Received SIGINT, cleaning up...');
+                isRunning = false;
+                clearInterval(pollInterval);
+                resolve('shutdown');  // Indicate normal shutdown
             });
         });
         
@@ -267,30 +275,41 @@ async function startScanning() {
 
 // Main application flow
 async function main() {
-    let retryCount = 0;
-    const MAX_RETRIES = 5;
-    const RETRY_DELAY = 5000; // 5 seconds
-
-    while (retryCount < MAX_RETRIES) {
+    while (true) {  // Run indefinitely
         try {
+            console.log('Starting device discovery...');
             const peripheral = await startScanning();
-            await connectAndRead(peripheral);
-            break; // Exit loop if successful
-        } catch (error) {
-            console.error(`Attempt ${retryCount + 1}/${MAX_RETRIES} failed:`, error.message);
-            retryCount++;
+            const result = await connectAndRead(peripheral);
             
-            if (retryCount < MAX_RETRIES) {
-                console.log(`Retrying in ${RETRY_DELAY/1000} seconds...`);
-                await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
+            // If we got here through a normal shutdown (Ctrl+C), exit the loop
+            if (result === 'shutdown') {
+                console.log('Normal shutdown requested');
+                break;
             }
+        } catch (error) {
+            console.error('Connection error:', error.message);
+            
+            // Wait before retrying
+            const RETRY_DELAY = 5000; // 5 seconds
+            console.log(`Retrying in ${RETRY_DELAY/1000} seconds...`);
+            await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
+            
+            // Clean up the existing connection if needed
+            if (aranet4Device && aranet4Device.state === 'connected') {
+                try {
+                    await aranet4Device.disconnectAsync();
+                } catch (disconnectError) {
+                    console.error('Error disconnecting:', disconnectError);
+                }
+            }
+            
+            // Continue the loop to retry
+            continue;
         }
     }
 
-    if (retryCount >= MAX_RETRIES) {
-        console.error('Max retries reached, exiting...');
-        await cleanup();
-    }
+    // Final cleanup
+    await cleanup();
 }
 
 // Handle cleanup on exit
