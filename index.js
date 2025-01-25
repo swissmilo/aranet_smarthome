@@ -1,6 +1,9 @@
 const noble = require('@abandonware/noble');
 const readline = require('readline');
 const axios = require('axios');
+const sgMail = require('@sendgrid/mail');
+const { Worker } = require('worker_threads');
+const path = require('path');
 require('dotenv').config();
 
 // Check if we're running on Linux (Raspberry Pi)
@@ -97,6 +100,50 @@ async function postToServer(readings) {
         }
     } catch (error) {
         console.error('Error posting to server:', error.message);
+    }
+}
+
+// Initialize SendGrid with your API key
+sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+
+async function sendErrorEmail(error) {
+    const errorTime = new Date().toISOString();
+    
+    try {
+        const msg = {
+            to: process.env.EMAIL_TO,
+            from: process.env.EMAIL_FROM,  // This needs to be verified in SendGrid
+            subject: `Aranet Reader Error - ${CONFIG.DEVICE_ID}`,
+            text: `
+Error Report from Aranet Reader
+
+Time: ${errorTime}
+Device: ${CONFIG.DEVICE_ID}
+Location: ${CONFIG.DEVICE_ID.replace('aranet4-', '')}
+
+Error Details:
+${error.message}
+
+Stack Trace:
+${error.stack}
+
+System Info:
+- Node Version: ${process.version}
+- Platform: ${process.platform}
+- Memory Usage: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB
+- Uptime: ${Math.round(process.uptime() / 3600)}h
+
+Please check the device and restart if necessary.
+`
+        };
+
+        await sgMail.send(msg);
+        console.log('Error notification email sent successfully');
+    } catch (emailError) {
+        console.error('Failed to send error notification email:', emailError.message);
+        if (emailError.response) {
+            console.error(emailError.response.body);
+        }
     }
 }
 
@@ -245,35 +292,120 @@ async function startScanning() {
     });
 }
 
-// Main application flow
-async function main() {
-    const POLLING_INTERVAL = 1800000; // 30 minutes
-    
-    while (true) {
-        try {
-            console.log('Starting device discovery...');
-            const peripheral = await startScanning();
-            const result = await connectAndRead(peripheral);
-            
-            if (result === 'success') {
-                console.log(`\nWaiting ${POLLING_INTERVAL/60000} minutes until next reading...`);
-                await new Promise(resolve => setTimeout(resolve, POLLING_INTERVAL));
-            } else {
-                // If not successful, wait a shorter time before retry
-                console.log('Waiting 30 seconds before retry...');
-                await new Promise(resolve => setTimeout(resolve, 30000));
-            }
-        } catch (error) {
-            console.error('Connection error:', error.message);
-            console.log('Waiting 30 seconds before retry...');
-            await new Promise(resolve => setTimeout(resolve, 30000));
+// Update the test email function to use SendGrid
+async function testEmailConfig() {
+    try {
+        const msg = {
+            to: process.env.EMAIL_TO,
+            from: process.env.EMAIL_FROM,
+            subject: 'Aranet Reader - Email Test',
+            text: 'This is a test email from your Aranet Reader application.'
+        };
+
+        await sgMail.send(msg);
+        console.log('Test email sent successfully');
+    } catch (error) {
+        console.error('Failed to send test email:', error);
+        if (error.response) {
+            console.error(error.response.body);
         }
     }
 }
 
-// Handle cleanup on exit
+async function runWorker() {
+    return new Promise((resolve, reject) => {
+        const worker = new Worker(path.join(__dirname, 'worker.js'));
+        let isTerminated = false;
+
+        const timeoutId = setTimeout(() => {
+            if (!isTerminated) {
+                isTerminated = true;
+                worker.terminate();
+                reject(new Error('Reading operation timed out'));
+            }
+        }, 60000);
+
+        worker.on('message', async (message) => {
+            clearTimeout(timeoutId);
+            if (!isTerminated) {
+                isTerminated = true;
+                if (message.success) {
+                    // Log the formatted readings
+                    console.log(`\n[${message.formattedReadings.time}] Readings:`);
+                    console.log(`CO2: ${message.formattedReadings.co2}`);
+                    console.log(`Temperature: ${message.formattedReadings.temperature}`);
+                    console.log(`Humidity: ${message.formattedReadings.humidity}`);
+                    console.log(`Pressure: ${message.formattedReadings.pressure}`);
+                    
+                    // Post to server
+                    await postToServer(message.data);
+                    resolve('success');
+                } else {
+                    reject(new Error(message.error));
+                }
+            }
+            worker.terminate();
+        });
+
+        worker.on('error', (error) => {
+            clearTimeout(timeoutId);
+            if (!isTerminated) {
+                isTerminated = true;
+                worker.terminate();
+                reject(error);
+            }
+        });
+
+        worker.on('exit', (code) => {
+            clearTimeout(timeoutId);
+            if (!isTerminated) {
+                isTerminated = true;
+                if (code !== 0) {
+                    reject(new Error(`Worker stopped with exit code ${code}`));
+                }
+            }
+        });
+    });
+}
+
+// Modify the main loop
+async function main() {
+    const POLLING_INTERVAL = 1800000; // 30 minutes
+    let lastRunTime = 0;
+    
+    if (process.env.TEST_EMAIL === 'true') {
+        await testEmailConfig();
+    }
+
+    while (true) {
+        const now = Date.now();
+        
+        if (now - lastRunTime >= POLLING_INTERVAL) {
+            try {
+                console.log('Starting new reading cycle...');
+                const result = await runWorker();
+                
+                if (result === 'success') {
+                    lastRunTime = now;
+                    console.log(`\nWaiting ${POLLING_INTERVAL/60000} minutes until next reading...`);
+                } else {
+                    await sendErrorEmail(new Error('Failed to get reading'));
+                }
+            } catch (error) {
+                console.error('Error during reading:', error.message);
+                await sendErrorEmail(error);
+            }
+        }
+        
+        // Short sleep to prevent CPU spinning
+        await new Promise(resolve => setTimeout(resolve, POLLING_INTERVAL + 5000)); // Add 5 second buffer
+    }
+}
+
+// Update cleanup to handle worker termination
 async function cleanup() {
     console.log('\nCleaning up...');
+    // Any active workers will be automatically terminated when the process exits
     if (aranet4Device && aranet4Device.state === 'connected') {
         try {
             await noble.stopScanningAsync();
