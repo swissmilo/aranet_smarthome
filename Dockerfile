@@ -11,8 +11,6 @@ RUN apt-get update && apt-get install -y \
     libbluetooth-dev \
     libudev-dev \
     libcap2-bin \
-    bluez-tools \
-    bluez-firmware \
     && rm -rf /var/lib/apt/lists/*
 
 # Clone the repository
