@@ -22,6 +22,8 @@ WORKDIR /usr/src/app
 # Copy environment variables from the build context
 COPY .env ./
 
+COPY package*.json ./
+
 # Install all Node.js dependencies at once
 RUN npm install --build-from-source
 
