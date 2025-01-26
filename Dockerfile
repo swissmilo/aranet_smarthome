@@ -1,5 +1,5 @@
 # Use Node 18 as it's more stable with bluetooth-hci-socket
-FROM node:18
+FROM node:18-bullseye
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -11,6 +11,8 @@ RUN apt-get update && apt-get install -y \
     libbluetooth-dev \
     libudev-dev \
     libcap2-bin \
+    bluez-tools \
+    bluez-firmware \
     && rm -rf /var/lib/apt/lists/*
 
 # Clone the repository
