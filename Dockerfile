@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y \
     bluetooth \
     bluez \
     libbluetooth-dev \
+    libudev-dev \
     libcap2-bin \
     && rm -rf /var/lib/apt/lists/*
 
@@ -21,7 +22,7 @@ WORKDIR /usr/src/app
 # Copy environment variables from the build context
 COPY .env ./
 
-# Install Node.js dependencies
+# Install all Node.js dependencies at once
 RUN npm install --build-from-source
 
 # Set capabilities for Node.js binary
