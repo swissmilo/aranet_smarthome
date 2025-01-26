@@ -7,7 +7,7 @@ const path = require('path');
 require('dotenv').config();
 
 // Check if we're running on Linux (Raspberry Pi)
-if (process.platform === 'linux') {
+/*if (process.platform === 'linux') {
     // noble needs special permissions on Linux
     console.log('Running on Linux, checking Bluetooth permissions...');
     try {
@@ -19,7 +19,7 @@ if (process.platform === 'linux') {
         console.error('Try running: sudo setcap cap_net_raw+eip $(eval readlink -f `which node`)');
         process.exit(1);
     }
-}
+}*/
 
 // Configuration from environment variables
 const CONFIG = {
