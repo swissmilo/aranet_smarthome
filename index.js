@@ -265,7 +265,7 @@ async function startScanning() {
         const handleDiscover = async (peripheral) => {
             const name = peripheral.advertisement.localName;
             
-            if (name?.includes('Aranet4') && !isConnected) {
+            if (name?.includes('Aranet4 29C35') && !isConnected) {
                 console.log('Found Aranet4 device! Details:');
                 console.log('Name:', name);
                 
